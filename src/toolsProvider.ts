@@ -1137,83 +1137,281 @@ export const toolsProvider: ToolsProvider = async (ctl) => {
   });
   tools.push(runInTerminalTool);
 
+  const webSearchTool = tool({
+    name: "web_search",
+    description: "Search the web using multiple providers (DuckDuckGo, Google, Bing). Uses no-key providers first, then browser providers as fallback.",
+    parameters: {
+      query: z.string(),
+      providers: z.array(z.enum(["duckduckgo-api", "duckduckgo-fetch", "duckduckgo-html", "google", "bing"]))
+        .optional()
+        .describe("Optional: List of specific providers. If omitted, fallback chain is: DDG API -> DDG HTML fetch -> DDG browser -> Google -> Bing."),
+    },
+    implementation: async ({ query, providers }) => {
+      type SearchProvider = "duckduckgo-api" | "duckduckgo-fetch" | "duckduckgo-html" | "google" | "bing";
+      type SearchResult = { title: string; link: string; snippet: string; provider: SearchProvider };
 
+      const results: SearchResult[] = [];
+      const errors: string[] = [];
+      const logs: string[] = [];
 
+      const decodeHtmlEntities = (value: string) =>
+        value
+          .replace(/&quot;/g, "\"")
+          .replace(/&#39;/g, "'")
+          .replace(/&apos;/g, "'")
+          .replace(/&lt;/g, "<")
+          .replace(/&gt;/g, ">")
+          .replace(/&nbsp;/g, " ")
+          .replace(/&amp;/g, "&");
 
-  
-  //2026.05.08: web_search modified by: SINAPSA_IC via ChatGPT
-const webSearchTool = tool({
-  name: "web_search",
-  description:
-    "Search the web using multiple providers (DuckDuckGo, Google, Bing). Uses no-key providers first, then browser providers as fallback.",
+      const stripHtml = (value: string) =>
+        decodeHtmlEntities(value)
+          .replace(/<[^>]+>/g, " ")
+          .replace(/\s+/g, " ")
+          .trim();
 
-  parameters: {
-    query: z.string(),
-    providers: z
-      .array(
-        z.enum([
-          "duckduckgo-api",
-          "duckduckgo-fetch",
-          "duckduckgo-html",
-          "google",
-          "bing",
-        ])
-      )
-      .optional(),
-  },
+      const normalizeDuckDuckGoLink = (link: string): string => {
+        const decoded = decodeHtmlEntities(link);
+        const absolute = decoded.startsWith("//")
+          ? `https:${decoded}`
+          : decoded.startsWith("/")
+            ? `https://duckduckgo.com${decoded}`
+            : decoded;
 
-  implementation: async ({ query }) => {
-    const L = [],
-      R = [];
-    let B;
+        try {
+          const parsed = new URL(absolute);
+          const redirect = parsed.searchParams.get("uddg");
+          if (redirect) {
+            return decodeURIComponent(redirect);
+          }
+        } catch {
+          // Return original normalized URL below.
+        }
 
-    const ok =
-      B ??
-      (B = import("puppeteer")
-        .then(async (p) => {
-          const b = await p.launch({
+        return absolute;
+      };
+
+      const parseDuckDuckGoHtml = (html: string, provider: "duckduckgo-fetch" | "duckduckgo-html"): SearchResult[] => {
+        const parsedResults: SearchResult[] = [];
+        const titleRegex = /<a[^>]*class="result__a"[^>]*href="([^"]+)"[^>]*>([\s\S]*?)<\/a>/gi;
+        let match: RegExpExecArray | null;
+
+        while ((match = titleRegex.exec(html)) !== null) {
+          const link = normalizeDuckDuckGoLink(match[1]);
+          const title = stripHtml(match[2]);
+          const nearbyHtml = html.slice(match.index, Math.min(html.length, match.index + 1800));
+          const snippetMatch = nearbyHtml.match(/class="result__snippet"[^>]*>([\s\S]*?)<\/(?:a|div)>/i);
+          const snippet = snippetMatch ? stripHtml(snippetMatch[1]) : "";
+
+          if (title && link) {
+            parsedResults.push({ title, link, snippet, provider });
+          }
+          if (parsedResults.length >= 10) break;
+        }
+
+        return parsedResults;
+      };
+
+      let sharedBrowser: Browser | null = null;
+      const getBrowser = async () => {
+        if (!sharedBrowser) {
+          const puppeteer = await import("puppeteer");
+          sharedBrowser = await puppeteer.launch({
             headless: true,
             args: ["--no-sandbox", "--disable-setuid-sandbox"],
           });
-          await b.close();
-          return 1;
-        })
-        .catch(() => 0));
-
-    const seen = new Set();
-
-    R.push(...(await searchFunctions["duckduckgo-fetch"](query).catch(() => [])));
-
-    if (await ok)
-      for (const k of [
-        "duckduckgo-api",
-        "duckduckgo-html",
-        "google",
-        "bing",
-      ])
-        R.push(...(await searchFunctions[k](query).catch(() => [])));
-
-    const out = R.filter((x) =>
-      x.link && !seen.has(x.link) ? (seen.add(x.link), 1) : 0
-    );
-
-    return out.length
-      ? {
-          results: out,
-          meta: {
-            total_found: out.length,
-            providers_used: [...new Set(out.map((r) => r.provider))],
-            no_api_key_required: true,
-            trace: L,
-          },
         }
-      : { error: "all failed", trace: L };
-  },
-});
+        return sharedBrowser;
+      };
 
-tools.push(webSearchTool);
-    //^ 2026.05.08: web_seacrch modified by: SINAPSA_IC via ChatGPT^
+      const searchFunctions: Record<SearchProvider, (q: string) => Promise<SearchResult[]>> = {
+        "duckduckgo-api": async (q: string) => {
+          const { search, SafeSearchType } = await import("duck-duck-scrape");
+          let attempt = 0;
+          let lastError: unknown = null;
 
+          while (attempt < 2) {
+            try {
+              const r = await search(q, { safeSearch: SafeSearchType.OFF });
+              if (r.results && r.results.length > 0) {
+                return r.results.slice(0, 10).map((result: any) => ({
+                  title: result.title,
+                  link: result.url,
+                  snippet: result.description,
+                  provider: "duckduckgo-api",
+                }));
+              }
+              break;
+            } catch (e) {
+              lastError = e;
+              attempt++;
+              await new Promise(res => setTimeout(res, 1000));
+            }
+          }
+
+          if (lastError) {
+            throw lastError;
+          }
+          throw new Error("DuckDuckGo API returned no results");
+        },
+
+        "duckduckgo-fetch": async (q: string) => {
+          const response = await fetch(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`, {
+            headers: {
+              "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+              "Accept-Language": "en-US,en;q=0.9",
+            },
+          });
+          if (!response.ok) {
+            throw new Error(`HTTP ${response.status}`);
+          }
+
+          const html = await response.text();
+          const extracted = parseDuckDuckGoHtml(html, "duckduckgo-fetch");
+          if (extracted.length > 0) return extracted;
+          throw new Error("No results parsed from DuckDuckGo HTML");
+        },
+
+        "duckduckgo-html": async (q: string) => {
+          const browser = await getBrowser();
+          try {
+            const page = await browser.newPage();
+            await page.goto(`https://html.duckduckgo.com/html/?q=${encodeURIComponent(q)}`, { waitUntil: "networkidle2", timeout: 15000 });
+
+            const html = await page.content();
+            const extracted = parseDuckDuckGoHtml(html, "duckduckgo-html");
+            if (extracted.length > 0) return extracted;
+            throw new Error("No results found");
+          } finally {
+            await browser.close();
+          }
+        },
+
+        "google": async (q: string) => {
+          const browser = await getBrowser();
+          try {
+            const page = await browser.newPage();
+            await page.goto(`https://www.google.com/search?q=${encodeURIComponent(q)}`, { waitUntil: "networkidle2", timeout: 15000 });
+
+            const extracted = await page.evaluate(() => {
+              const items = document.querySelectorAll("div.g");
+              const data = [];
+              for (const item of items) {
+                const titleEl = item.querySelector("h3");
+                const linkEl = item.querySelector("a");
+                const snippetEl = item.querySelector('div[style*="-webkit-line-clamp"]') || item.querySelector("div.VwiC3b");
+                if (titleEl && linkEl) {
+                  data.push({
+                    title: titleEl.innerText,
+                    link: linkEl.getAttribute("href") || "",
+                    snippet: snippetEl ? (snippetEl as HTMLElement).innerText : "",
+                    provider: "google" as const,
+                  });
+                }
+              }
+              return data;
+            });
+            if (extracted.length > 0) return extracted.slice(0, 10);
+            throw new Error("No results found");
+          } finally {
+            await browser.close();
+          }
+        },
+
+        "bing": async (q: string) => {
+          const browser = await getBrowser();
+          try {
+            const page = await browser.newPage();
+            await page.goto(`https://www.bing.com/search?q=${encodeURIComponent(q)}`, { waitUntil: "networkidle2", timeout: 15000 });
+
+            const extracted = await page.evaluate(() => {
+              const items = document.querySelectorAll("li.b_algo");
+              const data = [];
+              for (const item of items) {
+                const titleEl = item.querySelector("h2 a");
+                const linkEl = item.querySelector("h2 a");
+                const snippetEl = item.querySelector("p");
+                if (titleEl && linkEl) {
+                  data.push({
+                    title: (titleEl as HTMLElement).innerText,
+                    link: linkEl.getAttribute("href") || "",
+                    snippet: snippetEl ? (snippetEl as HTMLElement).innerText : "",
+                    provider: "bing" as const,
+                  });
+                }
+              }
+              return data;
+            });
+            if (extracted.length > 0) return extracted.slice(0, 10);
+            throw new Error("No results found");
+          } finally {
+            await browser.close();
+          }
+        },
+      };
+
+      if (providers && providers.length > 0) {
+        for (const providerKey of providers) {
+          try {
+            logs.push(`[Manual] Attempting ${providerKey}...`);
+            const pResults = await searchFunctions[providerKey](query);
+            results.push(...pResults);
+            logs.push(`[Manual] Success: ${providerKey} found ${pResults.length} results.`);
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            errors.push(`${providerKey}: ${errMsg}`);
+            logs.push(`[Manual] Failed: ${providerKey} - ${errMsg}`);
+          }
+        }
+      } else {
+        const chain: SearchProvider[] = ["duckduckgo-api", "duckduckgo-fetch", "duckduckgo-html", "google", "bing"];
+
+        for (let i = 0; i < chain.length; i++) {
+          const providerKey = chain[i];
+          const nextProvider = chain[i + 1];
+          try {
+            logs.push(`[Fallback Chain] Attempting ${providerKey}...`);
+            const pResults = await searchFunctions[providerKey](query);
+            results.push(...pResults);
+            logs.push(`[Fallback Chain] Success: ${providerKey} found ${pResults.length} results. Stopping chain.`);
+            break;
+          } catch (e) {
+            const errMsg = e instanceof Error ? e.message : String(e);
+            errors.push(`${providerKey}: ${errMsg}`);
+            const nextMsg = nextProvider ? `Falling back to ${nextProvider}...` : "No more providers.";
+            logs.push(`[Fallback Chain] Failed: ${providerKey} - ${errMsg}. ${nextMsg}`);
+          }
+        }
+      }
+
+      if (results.length === 0) {
+        return {
+          error: "All attempted search providers failed.",
+          attempts: errors,
+          trace: logs,
+        };
+      }
+
+      const seenLinks = new Set<string>();
+      const dedupedResults = results.filter(r => {
+        const key = r.link.trim();
+        if (!key || seenLinks.has(key)) return false;
+        seenLinks.add(key);
+        return true;
+      });
+
+      return {
+        results: dedupedResults,
+        meta: {
+          total_found: dedupedResults.length,
+          providers_used: [...new Set(dedupedResults.map(r => r.provider))],
+          no_api_key_required: true,
+          trace: logs,
+        },
+      };
+    },
+  });
+  tools.push(webSearchTool);
 
   const moveFileTool = tool({
     name: "move_file",
